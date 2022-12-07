@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -14,24 +14,21 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
+var interfacename = "ens33"
+
 func main() {
-	// Get a list of all interfaces.
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		panic(err)
-	}
 
 	var wg sync.WaitGroup
-	for _, iface := range ifaces {
-		wg.Add(1)
-		// Start up a scan on each interface.
-		go func(iface net.Interface) {
-			defer wg.Done()
-			if err := scan(&iface); err != nil {
-				log.Printf("interface %v: %v", iface.Name, err)
-			}
-		}(iface)
-	}
+
+	wg.Add(1)
+	// Start up a scan on each interface.
+	go func() {
+		defer wg.Done()
+		if err := scan(); err != nil {
+			log.Printf("interface %v: %v", interfacename, err)
+		}
+	}()
+
 	// Wait for all interfaces' scans to complete.  They'll try to run
 	// forever, but will stop on an error, so if we get past this Wait
 	// it means all attempts to write have failed.
@@ -42,36 +39,15 @@ func main() {
 //
 // scan loops forever, sending packets out regularly.  It returns an error if
 // it's ever unable to write a packet.
-func scan(iface *net.Interface) error {
+func scan() error {
 	// We just look for IPv4 addresses, so try to find if the interface has one.
-	var addr *net.IPNet
-	if addrs, err := iface.Addrs(); err != nil {
-		return err
-	} else {
-		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok {
-				if ip4 := ipnet.IP.To4(); ip4 != nil {
-					addr = &net.IPNet{
-						IP:   ip4,
-						Mask: ipnet.Mask[len(ipnet.Mask)-4:],
-					}
-					break
-				}
-			}
-		}
+	_, addr, err := net.ParseCIDR("192.168.4.3/24")
+	if err != nil {
+		log.Fatal(err)
 	}
-	// Sanity-check that the interface has a good address.
-	if addr == nil {
-		return errors.New("no good IP network found")
-	} else if addr.IP[0] == 127 {
-		return errors.New("skipping localhost")
-	} else if addr.Mask[0] != 0xff || addr.Mask[1] != 0xff {
-		return errors.New("mask means network is too large")
-	}
-	log.Printf("Using network range %v for interface %v", addr, iface.Name)
 
 	// Open up a pcap handle for packet reads/writes.
-	handle, err := pcap.OpenLive(iface.Name, 65536, true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(interfacename, 65536, true, pcap.BlockForever)
 	if err != nil {
 		return err
 	}
@@ -79,12 +55,12 @@ func scan(iface *net.Interface) error {
 
 	// Start up a goroutine to read in packet data.
 	stop := make(chan struct{})
-	go readARP(handle, iface, stop)
+	go readARP(handle, stop)
 	defer close(stop)
 	for {
 		// Write our scan packets out to the handle.
-		if err := writeARP(handle, iface, addr); err != nil {
-			log.Printf("error writing packets on %v: %v", iface.Name, err)
+		if err := writeARP(handle, addr); err != nil {
+			log.Printf("error writing packets on %v: %v", interfacename, err)
 			return err
 		}
 		// We don't know exactly how long it'll take for packets to be
@@ -97,7 +73,8 @@ func scan(iface *net.Interface) error {
 // readARP watches a handle for incoming ARP responses we might care about, and prints them.
 //
 // readARP loops until 'stop' is closed.
-func readARP(handle *pcap.Handle, iface *net.Interface, stop chan struct{}) {
+func readARP(handle *pcap.Handle, stop chan struct{}) {
+	//hwAddr, _ := net.ParseMAC(macadress)
 	src := gopacket.NewPacketSource(handle, layers.LayerTypeEthernet)
 	in := src.Packets()
 	for {
@@ -111,7 +88,7 @@ func readARP(handle *pcap.Handle, iface *net.Interface, stop chan struct{}) {
 				continue
 			}
 			arp := arpLayer.(*layers.ARP)
-			if arp.Operation != layers.ARPReply || bytes.Equal([]byte(iface.HardwareAddr), arp.SourceHwAddress) {
+			if arp.Operation != layers.ARPReply {
 				// This is a packet I sent.
 				continue
 			}
@@ -125,10 +102,20 @@ func readARP(handle *pcap.Handle, iface *net.Interface, stop chan struct{}) {
 
 // writeARP writes an ARP request for each address on our local network to the
 // pcap handle.
-func writeARP(handle *pcap.Handle, iface *net.Interface, addr *net.IPNet) error {
+func writeARP(handle *pcap.Handle, addr *net.IPNet) error {
+	hwAddr := getMacAddress(interfacename)
+	hostip := "192.168.4.3/24"
+	_, ipn, err := net.ParseCIDR(hostip)
+	if err != nil {
+		fmt.Println("Error", hostip, err)
+
+	}
+	fmt.Println("Error", ipn, ipn.IP)
+	host := net.ParseIP("192.168.4.3").To4()
+	fmt.Println("Error", host)
 	// Set up all the layers' fields we can.
 	eth := layers.Ethernet{
-		SrcMAC:       iface.HardwareAddr,
+		SrcMAC:       hwAddr,
 		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
 		EthernetType: layers.EthernetTypeARP,
 	}
@@ -138,8 +125,8 @@ func writeARP(handle *pcap.Handle, iface *net.Interface, addr *net.IPNet) error 
 		HwAddressSize:     6,
 		ProtAddressSize:   4,
 		Operation:         layers.ARPRequest,
-		SourceHwAddress:   []byte(iface.HardwareAddr),
-		SourceProtAddress: []byte(addr.IP),
+		SourceHwAddress:   []byte(hwAddr),
+		SourceProtAddress: []byte(host),
 		DstHwAddress:      []byte{0, 0, 0, 0, 0, 0},
 	}
 	// Set up buffer and options for serialization.
@@ -157,7 +144,7 @@ func writeARP(handle *pcap.Handle, iface *net.Interface, addr *net.IPNet) error 
 			layers.LayerTypeEthernet,
 			gopacket.Default,
 		)
-		tagpkt, err := PushVLAN(ret, 11)
+		tagpkt, err := PushVLAN(ret, 40)
 		if err != nil {
 			return err
 		}
@@ -224,4 +211,13 @@ func PushVLAN(pkt gopacket.Packet, vid uint16) (gopacket.Packet, error) {
 		return ret, nil
 	}
 	return nil, errors.New("failed to push vlan")
+}
+func getMacAddress(ifName string) net.HardwareAddr {
+	var err error
+	var netIf *net.Interface
+	var hwAddr net.HardwareAddr
+	if netIf, err = net.InterfaceByName(ifName); err == nil {
+		hwAddr = netIf.HardwareAddr
+	}
+	return hwAddr
 }
